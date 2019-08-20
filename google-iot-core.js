@@ -12,7 +12,7 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
- * 
+ *
  * Modifications Copyright 2017 Sense Tecnic Systems, Inc.
  **/
 
@@ -23,9 +23,9 @@ module.exports = function (RED) {
     var isUtf8 = require('is-utf8');
     var jwt = require('jsonwebtoken');
     var path = require("path");
-    var fs = require("fs-extra");    
+    var fs = require("fs-extra");
     var MQTTStore = require('mqtt-nedb-store');
-    
+
     var mqttDir = path.join(RED.settings.userDir, 'google-iot-core');
 
     // create a directory if needed for the data
@@ -56,6 +56,7 @@ module.exports = function (RED) {
     function MQTTBrokerNode(n) {
 
         RED.nodes.createNode(this, n);
+        this.myEmitter = RED.events;
         this.manager = MQTTStore(path.join(mqttDir,  n.id));
 
         // Configuration options passed by Node Red
@@ -138,14 +139,16 @@ module.exports = function (RED) {
         }
         if (this.persistout) {
             this.options.outgoingStore = this.manager.outgoing;
-            this.manager.outgoing.db.persistence.setAutocompactionInterval(this.compactinterval*1000);            
+            this.manager.outgoing.db.persistence.setAutocompactionInterval(this.compactinterval*1000);
         }
 
         // If there's no rejectUnauthorized already, then this could be an
         // old config where this option was provided on the broker node and
         // not the tls node
         if (typeof this.options.rejectUnauthorized === 'undefined') {
-            this.options.rejectUnauthorized = (this.verifyservercert == "true" || this.verifyservercert === true);
+            this.options.rejectUnauthorized = (
+                this.verifyservercert == "true" || this.verifyservercert === true
+            );
         }
 
         if (n.willTopic) {
@@ -184,79 +187,104 @@ module.exports = function (RED) {
             done();
         };
 
+        function connectHandler() {
+            if (!node.canConnect){
+                return;
+            }
+            node.connecting = false;
+            node.connected = true;
+            node.log(RED._("google-iot-core.state.connected", { broker: (node.clientid ? node.clientid + "@" : "") + node.brokerurl }));
+            for (var id in node.users) {
+                if (node.users.hasOwnProperty(id)) {
+                    node.users[id].status({ fill: "green", shape: "dot", text: "node-red:common.status.connected" });
+                }
+            }
+            // Remove any existing listeners before resubscribing to avoid duplicates in the event of a re-connection
+            node.client.removeAllListeners('message');
+
+            // Re-subscribe to stored topics
+            for (var s in node.subscriptions) {
+                if (node.subscriptions.hasOwnProperty(s)) {
+                    var topic = s;
+                    var qos = 0;
+                    for (var r in node.subscriptions[s]) {
+                        if (node.subscriptions[s].hasOwnProperty(r)) {
+                            qos = Math.max(qos, node.subscriptions[s][r].qos);
+                            node.client.on('message', node.subscriptions[s][r].handler);
+                        }
+                    }
+                    var options = { qos: qos };
+                    node.client.subscribe(topic, options);
+                }
+            }
+
+            // Send any birth message
+            if (node.birthMessage) {
+                node.publish(node.birthMessage);
+            }
+
+        }
+        function reconnectHandler() {
+            for (var id in node.users) {
+                if (node.users.hasOwnProperty(id)) {
+                    node.users[id].status({ fill: "yellow", shape: "ring", text: "node-red:common.status.connecting" });
+                }
+            }
+        }
+
+        function disconnectHandler(){
+            // refresh JWT token
+            node.client.options.password = createJwt(node.projectid, node.options.key);
+            if (node.connected) {
+                node.connected = false;
+                node.log(RED._("google-iot-core.state.disconnected", { broker: (node.clientid ? node.clientid + "@" : "") + node.brokerurl }));
+                for (var id in node.users) {
+                    if (node.users.hasOwnProperty(id)) {
+                        node.users[id].status({ fill: "red", shape: "ring", text: "node-red:common.status.disconnected" });
+                    }
+                }
+            } else if (node.connecting) {
+                node.log(RED._("google-iot-core.state.connect-failed", { broker: (node.clientid ? node.clientid + "@" : "") + node.brokerurl }));
+            }
+        }
+
+        function setConnectHandler(){
+            node.canConnect = true;
+        }
+
+        function setNotConnectHandler(){
+            node.canConnect = false;
+        }
+
+        this.myEmitter.on('connect',   connectHandler);    // Register for event connect
+        this.myEmitter.on('reconnect', reconnectHandler);  // Register for event reconnect
+        this.myEmitter.on('close',     disconnectHandler); // Register for event disconnect
+	    this.myEmitter.on('setConnect', setConnectHandler);
+        this.myEmitter.on('setNotConnect', setNotConnectHandler);
+
         this.connect = function () {
             if (!node.connected && !node.connecting) {
                 node.connecting = true;
-                node.client = mqtt.connect(node.brokerurl, node.options);
-                node.client.setMaxListeners(0);
-                // Register successful connect or reconnect handler
-                node.client.on('connect', function () {
-                    node.connecting = false;
-                    node.connected = true;
-                    node.log(RED._("google-iot-core.state.connected", { broker: (node.clientid ? node.clientid + "@" : "") + node.brokerurl }));
-                    for (var id in node.users) {
-                        if (node.users.hasOwnProperty(id)) {
-                            node.users[id].status({ fill: "green", shape: "dot", text: "node-red:common.status.connected" });
-                        }
-                    }
-                    // Remove any existing listeners before resubscribing to avoid duplicates in the event of a re-connection
-                    node.client.removeAllListeners('message');
+                try {
+                    node.client = mqtt.connect(node.brokerurl, node.options);
+                    node.client.setMaxListeners(0);
 
-                    // Re-subscribe to stored topics
-                    for (var s in node.subscriptions) {
-                        if (node.subscriptions.hasOwnProperty(s)) {
-                            var topic = s;
-                            var qos = 0;
-                            for (var r in node.subscriptions[s]) {
-                                if (node.subscriptions[s].hasOwnProperty(r)) {
-                                    qos = Math.max(qos, node.subscriptions[s][r].qos);
-                                    node.client.on('message', node.subscriptions[s][r].handler);
-                                }
-                            }
-                            var options = { qos: qos };
-                            node.client.subscribe(topic, options);
-                        }
-                    }
+                    // Register successful connect or reconnect handler
+                    node.client.on('connect', connectHandler);
+                    node.client.on("reconnect", reconnectHandler);
 
-                    // Send any birth message
-                    if (node.birthMessage) {
-                        node.publish(node.birthMessage);
-                    }
-                });
-                node.client.on("reconnect", function () {
-                    for (var id in node.users) {
-                        if (node.users.hasOwnProperty(id)) {
-                            node.users[id].status({ fill: "yellow", shape: "ring", text: "node-red:common.status.connecting" });
-                        }
-                    }
-                })
-                // Register disconnect handlers
-                node.client.on('close', function () {
-                    // refresh JWT token
-                    node.client.options.password = createJwt(node.projectid, node.options.key);
-                    if (node.connected) {
-                        node.connected = false;
-                        node.log(RED._("google-iot-core.state.disconnected", { broker: (node.clientid ? node.clientid + "@" : "") + node.brokerurl }));
-                        for (var id in node.users) {
-                            if (node.users.hasOwnProperty(id)) {
-                                node.users[id].status({ fill: "red", shape: "ring", text: "node-red:common.status.disconnected" });
-                            }
-                        }
-                    } else if (node.connecting) {
-                        node.log(RED._("google-iot-core.state.connect-failed", { broker: (node.clientid ? node.clientid + "@" : "") + node.brokerurl }));
-                    }
-                });
+                    // Register disconnect handlers
+                    node.client.on('close', disconnectHandler);
 
-                // Register connect error handler
-                node.client.on('error', function (error) {
-                    // refresh JWT token
-                    node.client.options.password = createJwt(node.projectid, node.options.key);
-                    if (node.connecting) {
-                        node.client.end();
-                        node.connecting = false;
-                    }
-                    node.error(error);
-                });
+                    // Register set connect variables
+                    node.client.on('setConnect', setConnectHandler);
+                    node.client.on('setNotConnect', setNotConnectHandler);
+
+                    // The client's own reconnect logic will take care of errors
+                    node.client.on('error', function (error) {});
+                }catch(err) {
+                    console.log(err);
+                }
             }
         };
 
@@ -334,7 +362,7 @@ module.exports = function (RED) {
                 done();
             }
         }
-        
+
         this.on('close', function (removed, done) {
             this.closing = true;
             if (this.connected) {
@@ -348,7 +376,7 @@ module.exports = function (RED) {
             } else {
                 deleteStore(removed, done);
             }
-        }); 
+        });
     }
 
     function MQTTInNode(n) {
@@ -424,7 +452,29 @@ module.exports = function (RED) {
                 }
                 if (msg.hasOwnProperty("payload")) {
                     if (msg.hasOwnProperty("topic") && (typeof msg.topic === "string") && (msg.topic !== "")) { // topic must exist
-                        this.brokerConn.publish(msg);  // send the message
+
+                        if (msg.payload.hasOwnProperty("canConnect")){
+                            console.log("Can connect: ", msg.payload.canConnect);
+
+                            if (msg.payload.canConnect === true) {
+                                console.log("Emmiting connect event");
+
+                                //nodeContext.set('canConnect', true);
+                                this.brokerConn.myEmitter.emit('setConnect');
+                                this.brokerConn.myEmitter.emit('connect');
+                            }
+                            else{
+                                console.log("Emmiting disconnect event");
+
+                                //nodeContext.set('canConnect', false);
+                                this.brokerConn.myEmitter.emit('setNotConnect');
+                                this.brokerConn.myEmitter.emit('close');
+                            }
+                        }
+                        else{
+                            console.log("Publishing msg");
+                            this.brokerConn.publish(msg);  // send the message
+                        }
                     }
                     else { node.warn(RED._("google-iot-core.errors.invalid-topic")); }
                 }
